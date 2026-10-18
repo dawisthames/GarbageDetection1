@@ -4,9 +4,10 @@ from ultralytics import YOLO
 import tempfile
 from PIL import Image
 import numpy as np
+from pathlib import Path
 
-# Load YOLO model
-model = YOLO("1_model/1_model/deploy/models/my_model.pt")
+# Resolve the weights relative to this file, independently of the launch folder.
+MODEL_PATH = Path(__file__).resolve().parent / "models" / "my_model.pt"
 # YOLO class names
 
 yolo_classes = [
@@ -56,6 +57,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
     page_title="Object Detection",
 )
+
+# Keep one model per visitor session instead of reloading on every interaction.
+if "yolo_model" not in st.session_state:
+    st.session_state.yolo_model = YOLO(str(MODEL_PATH))
+model = st.session_state.yolo_model
 
 # Initialize session state variables
 if "is_detecting" not in st.session_state:
