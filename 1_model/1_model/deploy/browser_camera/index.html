@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font:15px system-ui,sans-serif;margin:0;color:#fafafa;background:transparent}
+button{padding:10px 18px;border:1px solid #777;border-radius:8px;cursor:pointer;margin-right:8px;font:inherit}
+button:disabled{opacity:.5;cursor:default}#status{min-height:24px;margin:12px 0}
+.views{display:flex;gap:16px;flex-wrap:wrap}.view{flex:1;min-width:240px}
+video,img{width:100%;max-height:420px;object-fit:contain;background:#16191f;border-radius:8px}
+video{transform:scaleX(-1)}p{margin:6px 0}img:not([src]){display:none}
+</style></head>
+<body>
+<button id="start">Start camera</button><button id="stop" disabled>Stop camera</button>
+<p id="status" role="status">Your camera starts only when you click Start camera. Audio is not requested.</p>
+<div class="views"><div class="view"><p>Camera preview</p><video id="video" autoplay muted playsinline></video></div>
+<div class="view"><p>Latest detection</p><img id="result" alt="Detected objects with bounding boxes"></div></div>
+<canvas id="canvas" hidden></canvas>
+<script>
+const startButton=document.getElementById('start'),stopButton=document.getElementById('stop');
+const video=document.getElementById('video'),result=document.getElementById('result');
+const status=document.getElementById('status'),canvas=document.getElementById('canvas');
+let stream=null,active=false,pending=null,timer=null,timeout=null,generation=0;
+const parentOrigin=new URL(document.referrer || location.href).origin;
+function send(type,data={}){window.parent.postMessage({isStreamlitMessage:true,type,...data},parentOrigin)}
+function height(){send('streamlit:setFrameHeight',{height:document.body.scrollHeight+16})}
+function stopCamera(message='Camera stopped.',notify=true){
+  generation++;active=false;pending=null;clearTimeout(timer);clearTimeout(timeout);
+  if(stream)stream.getTracks().forEach(track=>track.stop());
+  stream=null;video.srcObject=null;startButton.disabled=false;stopButton.disabled=true;
+  status.textContent=message;
+  if(notify)send('streamlit:setComponentValue',{value:{stopped:true,id:crypto.randomUUID()},dataType:'json'});
+  height();
+}
+function capture(){
+  if(!active || pending)return;
+  if(!video.videoWidth){timer=setTimeout(capture,200);return}
+  const scale=Math.min(1,640/video.videoWidth,480/video.videoHeight);
+  canvas.width=Math.round(video.videoWidth*scale);canvas.height=Math.round(video.videoHeight*scale);
+  canvas.getContext('2d').drawImage(video,0,0,canvas.width,canvas.height);
+  pending=crypto.randomUUID();
+  status.textContent='Camera on — processing a frame…';
+  send('streamlit:setComponentValue',{value:{id:pending,image:canvas.toDataURL('image/jpeg',.75).split(',')[1]},dataType:'json'});
+  timeout=setTimeout(()=>stopCamera('The server took too long to respond. Click Start camera to retry.'),90000);
+}
+startButton.onclick=async()=>{
+  const attempt=++generation;
+  startButton.disabled=true;status.textContent='Allow camera access in your browser…';
+  try{
+    if(!navigator.mediaDevices?.getUserMedia)throw new Error('Camera access requires a supported browser and HTTPS.');
+    const acquired=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:'user'},audio:false});
+    if(attempt!==generation){acquired.getTracks().forEach(t=>t.stop());return}
+    stream=acquired;video.srcObject=stream;await video.play();
+    if(attempt!==generation)return;
+    active=true;stopButton.disabled=false;result.removeAttribute('src');
+    stream.getVideoTracks()[0].addEventListener('ended',()=>{if(active)stopCamera('Camera disconnected. Reconnect it and try again.')});
+    capture();height();
+  }catch(error){
+    const messages={NotAllowedError:'Camera permission was denied. Allow Camera in your browser site settings, then try again.',NotFoundError:'No camera was found. Connect a camera and try again.',NotReadableError:'The camera is busy or unavailable. Close other apps using it and try again.'};
+    stopCamera(messages[error.name] || error.message);
+  }
+};
+stopButton.onclick=()=>stopCamera();
+window.addEventListener('message',event=>{
+  if(event.source!==window.parent || event.origin!==parentOrigin || event.data.type!=='streamlit:render')return;
+  const args=event.data.args || {},reply=args.result || {};
+  if(event.data.theme)document.body.style.color=event.data.theme.textColor;
+  if(active && pending && reply.id===pending){
+    clearTimeout(timeout);pending=null;
+    if(reply.error){stopCamera(reply.error);return}
+    if(reply.image)result.src='data:image/jpeg;base64,'+reply.image;
+    status.textContent='Camera on — detection is updating automatically.';
+    timer=setTimeout(capture,500);
+  }
+  height();
+});
+document.addEventListener('visibilitychange',()=>{if(document.hidden && stream)stopCamera('Camera paused. Click Start camera to resume.')});
+window.addEventListener('pagehide',()=>stopCamera('Camera stopped.',false));
+new ResizeObserver(height).observe(document.body);
+send('streamlit:componentReady',{apiVersion:1});height();
+</script></body></html>

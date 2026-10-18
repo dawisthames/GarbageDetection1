@@ -2,6 +2,8 @@ import cv2
 import streamlit as st
 from ultralytics import YOLO
 import tempfile
+import base64
+from streamlit.components.v1 import declare_component
 from PIL import Image
 import numpy as np
 from pathlib import Path
@@ -99,92 +101,58 @@ def display_detection_messages(detected_classes):
                     st.error(f"⬛ {disposal_messages[class_name]}")
 
 
-# Function for live object detection using webcam
+# Camera frames arrive from the visitor's browser over Streamlit's connection.
+_browser_camera = declare_component(
+    "browser_camera", path=str(Path(__file__).resolve().parent / "browser_camera")
+)
+
+
 def live_streaming(conf_threshold, selected_classes):
-    stframe = st.empty()
-    message_container = st.empty()
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        st.error(
-            "Error: Could not access the webcam. Please make sure your webcam is working."
-        )
+    st.caption("Click Start camera below and allow camera access. Detection updates automatically; speed depends on the server.")
+    previous = st.session_state.get("camera_result", {})
+    event = _browser_camera(result=previous, key="browser_camera", default=None)
+    if not event or not isinstance(event, dict):
         return
-
-    try:
-        while st.session_state.get("is_detecting", False) and st.session_state.get(
-            "is_webcam_active", False
-        ):
-            ret, frame = cap.read()
-
-            if not ret:
-                st.warning("Warning: Failed to read frame from the webcam. Retrying...")
-                continue
-
-            try:
-                results = model.predict(source=frame, conf=conf_threshold)
-                detections = results[0]
-
-                # Extract bounding boxes, confidence scores, and class IDs
-                boxes = (
-                    detections.boxes.xyxy.cpu().numpy() if len(detections) > 0 else []
-                )
-                confs = (
-                    detections.boxes.conf.cpu().numpy() if len(detections) > 0 else []
-                )
-                class_ids = (
-                    detections.boxes.cls.cpu().numpy().astype(int)
-                    if len(detections) > 0
-                    else []
-                )
-
-                # Filter based on selected classes
-                detected_classes = []
-                if selected_classes:
-                    filtered = [
-                        (box, conf, class_id)
-                        for box, conf, class_id in zip(boxes, confs, class_ids)
-                        if yolo_classes[class_id] in selected_classes
-                    ]
-                    if filtered:
-                        boxes, confs, class_ids = zip(*filtered)
-                        detected_classes = [yolo_classes[class_id] for class_id in class_ids]
-                    else:
-                        boxes, confs, class_ids = [], [], []
-                else:
-                    detected_classes = [yolo_classes[class_id] for class_id in class_ids]
-
-                # Draw bounding boxes and labels on the frame
-                for i, box in enumerate(boxes):
-                    x1, y1, x2, y2 = map(int, box)
-                    label = f"{yolo_classes[class_ids[i]]}: {confs[i]:.2f}"
-                    cv2.rectangle(
-                        frame, (x1, y1), (x2, y2), color=(0, 255, 0), thickness=2
-                    )
-                    cv2.putText(
-                        frame,
-                        label,
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (255, 255, 255),
-                        2,
-                    )
-
-                # Display the frame in Streamlit
-                stframe.image(frame, channels="BGR")
-                
-                # Display detection messages
-                with message_container.container():
-                    display_detection_messages(detected_classes)
-
-            except Exception as e:
-                st.error(f"Error during model prediction: {str(e)}")
-
-    finally:
-        # Ensure resources are properly released
-        cap.release()
-        cv2.destroyAllWindows()
+    if event.get("stopped"):
+        st.session_state.pop("camera_result", None)
+        return
+    frame_id = event.get("id")
+    if frame_id and frame_id != previous.get("id"):
+        try:
+            encoded = event.get("image", "")
+            if not isinstance(encoded, str) or len(encoded) > 1_000_000:
+                raise ValueError("Camera frame is too large.")
+            data = base64.b64decode(encoded, validate=True)
+            frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is None or max(frame.shape[:2]) > 1280:
+                raise ValueError("Invalid camera frame.")
+            class_filter = [yolo_classes.index(name) for name in selected_classes] or None
+            detection = model.predict(
+                source=frame, conf=conf_threshold, classes=class_filter,
+                imgsz=640, verbose=False,
+            )[0]
+            names = sorted({detection.names[int(i)] for i in detection.boxes.cls.tolist()})
+            ok, jpeg = cv2.imencode(".jpg", detection.plot(), [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                raise ValueError("Could not display the detection result.")
+            st.session_state.camera_result = {
+                "id": frame_id,
+                "image": base64.b64encode(jpeg.tobytes()).decode("ascii"),
+                "classes": names,
+            }
+        except Exception:
+            st.session_state.camera_result = {
+                "id": frame_id,
+                "error": "Could not process this frame. Stop and restart the camera to try again.",
+            }
+        # Deliver the processed frame and acknowledge it before accepting another.
+        st.rerun()
+    if previous.get("error"):
+        st.error(previous["error"])
+    elif previous.get("id"):
+        display_detection_messages(previous.get("classes", []))
+        if not previous.get("classes"):
+            st.info("No selected waste objects detected in this frame.")
 
 
 def video_streaming(uploaded_file, conf_threshold, selected_classes):
@@ -320,6 +288,7 @@ with st.sidebar:
     if st.button(
         "Use Webcam 📷" if not st.session_state.is_webcam_active else "Stop Webcam 🛑"
     ):
+        st.session_state.pop("camera_result", None)
         st.session_state.is_webcam_active = not st.session_state.is_webcam_active
         if st.session_state.is_webcam_active:
             st.session_state.is_detecting = True
@@ -332,7 +301,7 @@ with st.sidebar:
             if not st.session_state.is_detecting
             else "Stop Detection 🛑"
         ),
-        disabled=(not uploaded_file and not st.session_state.is_webcam_active),
+        disabled=(not uploaded_file or st.session_state.is_webcam_active),
     )
 
     if detect_button:
@@ -366,7 +335,7 @@ with st.sidebar:
 # Handle object detection based on user input
 if st.session_state.is_detecting:
     if st.session_state.is_webcam_active:
-        st.info("Detecting objects using webcam...")
+        st.info("Browser camera detection")
         live_streaming(confidence_threshold, selected_classes)
     elif uploaded_file:
         file_extension = uploaded_file.name.split(".")[-1].lower()
@@ -388,7 +357,7 @@ else:
             This is a group project by **Num Chakhatanon** and **Dawis Meedech** to help people sort garbage more easily.
             
             **Features:**
-            - Real-time object detection via webcam
+            - Automatic object detection from your browser camera
             - Image and video analysis
             - Smart disposal recommendations
             - Multiple waste categories supported
